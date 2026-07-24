@@ -222,6 +222,59 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_initially_blocked_stays_blocked_after_recompute(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="waiting for operator",
+            assignee="alice",
+            initial_status="blocked",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        events = kb.list_events(conn, tid)
+        assert [event.kind for event in events] == ["created", "blocked"]
+        assert events[1].payload == {
+            "reason": "initial_status",
+            "kind": "capability",
+            "source": "creation",
+        }
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+
+
+def test_create_task_initially_blocked_with_parent_requires_explicit_unblock(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="prerequisite")
+        child = kb.create_task(
+            conn,
+            title="waiting for operator after prerequisite",
+            assignee="alice",
+            parents=[parent],
+            initial_status="blocked",
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+
+        kb.complete_task(conn, parent)
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+
+        assert kb.unblock_task(conn, child) is True
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "ready"
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

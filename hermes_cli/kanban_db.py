@@ -3141,6 +3141,21 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # ``initial_status='blocked'`` is an explicit operator gate,
+                    # not an inferred dependency wait.  Record the same sticky
+                    # lifecycle signal as block_task() so recompute_ready() cannot
+                    # silently promote the task on the next dispatcher sweep.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status",
+                            "kind": "capability",
+                            "source": "creation",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
