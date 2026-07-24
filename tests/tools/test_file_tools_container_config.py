@@ -21,6 +21,10 @@ def _make_env_config(**overrides):
         "docker_volumes": [],
         "docker_mount_cwd_to_workspace": True,
         "docker_forward_env": ["MY_SECRET", "API_KEY"],
+        "docker_env": {"SAFE_FLAG": "1"},
+        "docker_extra_args": ["--read-only"],
+        "docker_persist_across_processes": False,
+        "docker_orphan_reaper": False,
     }
     base.update(overrides)
     return base
@@ -58,6 +62,23 @@ class TestFileToolsContainerConfig:
         """docker_forward_env is forwarded to container_config."""
         cc = self._run(_make_env_config(docker_forward_env=["MY_SECRET"]), "t2").get("container_config", {})
         assert cc.get("docker_forward_env") == ["MY_SECRET"]
+
+    def test_docker_reuse_and_runtime_options_passed(self):
+        """File tools must not silently restore cross-process Docker reuse."""
+        cc = self._run(
+            _make_env_config(
+                docker_env={"SAFE_FLAG": "1"},
+                docker_extra_args=["--read-only"],
+                docker_persist_across_processes=False,
+                docker_orphan_reaper=False,
+            ),
+            "t-runtime",
+        ).get("container_config", {})
+
+        assert cc.get("docker_env") == {"SAFE_FLAG": "1"}
+        assert cc.get("docker_extra_args") == ["--read-only"]
+        assert cc.get("docker_persist_across_processes") is False
+        assert cc.get("docker_orphan_reaper") is False
 
     def test_docker_mount_cwd_defaults_to_false(self):
         """docker_mount_cwd_to_workspace defaults to False when absent from config."""
