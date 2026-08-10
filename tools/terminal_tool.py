@@ -1093,6 +1093,7 @@ _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox cr
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
 _cleanup_running = False
+_ATEXIT_CLEANUP_TIMEOUT_SECONDS = 65.0
 
 # Once-per-process guard for the docker orphan reaper (issue #20561).
 # Set when _maybe_reap_docker_orphans first runs; concurrent _create_environment
@@ -1731,24 +1732,8 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
     Shared by the terminal tool's own get-or-create path and the lazy
     :func:`ensure_task_env` bring-up (see :func:`_ssh_config_from_config`).
     """
-    return {
-        "container_cpu": config.get("container_cpu", 1),
-        "container_memory": config.get("container_memory", 5120),
-        "container_disk": config.get("container_disk", 51200),
-        "container_persistent": config.get("container_persistent", True),
-        "modal_mode": config.get("modal_mode", "auto"),
-        "vercel_runtime": config.get("vercel_runtime", ""),
-        "docker_volumes": config.get("docker_volumes", []),
-        "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-        "docker_forward_env": config.get("docker_forward_env", []),
-        "docker_env": config.get("docker_env", {}),
-        "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-        "docker_extra_args": config.get("docker_extra_args", []),
-        "docker_shm_size": config.get("docker_shm_size", "1g"),
-        "docker_network": config.get("docker_network", True),
-        "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-        "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-    }
+    from tools.container_config import project_container_config
+    return project_container_config(config)
 
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
@@ -2160,17 +2145,34 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 def cleanup_all_environments():
-    """Clean up ALL active environments. Use with caution."""
-    task_ids = list(_active_environments.keys())
+    """Clean up ALL active environments and await bounded async teardown."""
+    # Keep the environment objects after cleanup_vm() drains the registry so
+    # one-shot callers can join Docker cleanup workers before process exit.
+    with _env_lock:
+        active_items = list(_active_environments.items())
+    task_ids = [task_id for task_id, _env in active_items]
+    envs_to_wait = [env for _task_id, env in active_items]
     cleaned = 0
-    
+
     for task_id in task_ids:
         try:
             cleanup_vm(task_id)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
-    
+
+    # One shared deadline bounds total shutdown time regardless of environment
+    # count while allowing Docker stop + rm to use their two 30s bounds.
+    cleanup_deadline = time.monotonic() + _ATEXIT_CLEANUP_TIMEOUT_SECONDS
+    for env in envs_to_wait:
+        wait_fn = getattr(env, "wait_for_cleanup", None)
+        if wait_fn is None:
+            continue
+        try:
+            wait_fn(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        except Exception as e:  # never block shutdown on a bad backend
+            logger.debug("wait_for_cleanup raised during cleanup: %s", e)
+
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
     import glob

@@ -29,6 +29,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -6260,6 +6261,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             row = cursor.fetchone()
         return self._session_row_dict(row) if row else None
+
+    def list_concluded_session_tips_after(
+        self, after_ended_at: float = 0.0, after_session_id: str = "", limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return metadata-only conclusions ordered by ``(ended_at, session_id)``."""
+        page_limit = max(1, min(int(limit), 1000))
+        cursor_ended_at = float(after_ended_at)
+        cursor_session_id = str(after_session_id)
+        delegate_from = _delegate_from_json("s.model_config")
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                f"""
+                WITH RECURSIVE compression_lineage(session_id, lineage_root) AS (
+                    SELECT s0.id, s0.id FROM sessions s0
+                    LEFT JOIN sessions p0 ON p0.id = s0.parent_session_id
+                    WHERE s0.parent_session_id IS NULL OR COALESCE(p0.end_reason, '') <> 'compression'
+                    UNION ALL
+                    SELECT child.id, chain.lineage_root
+                    FROM compression_lineage chain
+                    JOIN sessions parent ON parent.id = chain.session_id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                      AND {_delegate_from_json('child.model_config')} IS NULL
+                )
+                SELECT s.id AS session_id, COALESCE(chain.lineage_root, s.id) AS lineage_root,
+                       s.ended_at, s.end_reason, s.title, s.source,
+                       (SELECT MAX(m.id) FROM messages m WHERE m.session_id = s.id) AS last_message_id
+                FROM sessions s
+                LEFT JOIN compression_lineage chain ON chain.session_id = s.id
+                WHERE s.ended_at IS NOT NULL AND s.end_reason IS NOT NULL
+                  AND s.end_reason NOT IN ('agent_close', 'ws_orphan_reap', 'compression')
+                  AND s.source NOT IN ('kanban', 'subagent', 'tool')
+                  AND {delegate_from} IS NULL
+                  AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
+                  AND (s.ended_at > ? OR (s.ended_at = ? AND s.id > ?))
+                ORDER BY s.ended_at ASC, s.id ASC LIMIT ?
+                """,
+                (cursor_ended_at, cursor_ended_at, cursor_session_id, page_limit),
+            ).fetchall()
+        return [{
+            "session_id": row["session_id"], "lineage_root": row["lineage_root"],
+            "status": "concluded", "ended_at": float(row["ended_at"]),
+            "ended_at_utc": datetime.fromtimestamp(float(row["ended_at"]), timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end_reason": row["end_reason"], "last_message_id": row["last_message_id"],
+            "title": row["title"], "source": row["source"],
+        } for row in rows]
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

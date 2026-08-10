@@ -31,6 +31,8 @@ support.
 
 import json
 import logging
+import math
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
 # Sources that are excluded from session browsing/searching by default.
@@ -407,6 +409,8 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
         return tool_error(f"failed to load session: {e}", success=False)
 
     shaped = [_shape_message(m) for m in rows]
+    ended_at = meta.get("ended_at")
+    last_message_id = max((m.get("id") for m in rows if m.get("id") is not None), default=None)
     total = len(shaped)
     truncated = total > head + tail
     window = shaped[:head] + shaped[-tail:] if truncated else shaped
@@ -421,6 +425,11 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
             "source": meta.get("source"),
             "model": meta.get("model"),
             "title": meta.get("title"),
+            "status": "concluded" if ended_at is not None else "active",
+            "ended_at": ended_at,
+            "ended_at_utc": (datetime.fromtimestamp(float(ended_at), timezone.utc).isoformat().replace("+00:00", "Z") if ended_at is not None else None),
+            "end_reason": meta.get("end_reason"),
+            "last_message_id": last_message_id,
         },
         "message_count": total,
         "truncated": truncated,
@@ -432,6 +441,47 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
             "Pass around_message_id (any id above) to scroll the middle."
         )
     return json.dumps(response, ensure_ascii=False)
+
+
+def _concluded_feed(db, *, limit: int, after_ended_at=None, after_session_id=None, link_profile: str = None) -> str:
+    """Return one authenticated, metadata-only concluded-session page."""
+    cursor_present = after_ended_at is not None or after_session_id is not None
+    if (after_ended_at is None) != (after_session_id is None):
+        return tool_error("concluded cursor requires both after_ended_at and after_session_id", success=False)
+    if cursor_present:
+        if isinstance(after_ended_at, bool) or not isinstance(after_session_id, str):
+            return tool_error("invalid concluded-session cursor", success=False)
+        try:
+            cursor_ended_at = float(after_ended_at)
+        except (TypeError, ValueError):
+            return tool_error("invalid concluded-session cursor", success=False)
+        if not math.isfinite(cursor_ended_at) or cursor_ended_at < 0:
+            return tool_error("invalid concluded-session cursor", success=False)
+        cursor_session_id = after_session_id
+    else:
+        cursor_ended_at, cursor_session_id = 0.0, ""
+    try:
+        page_limit = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        return tool_error("limit must be an integer", success=False)
+    try:
+        rows = db.list_concluded_session_tips_after(cursor_ended_at, cursor_session_id, page_limit + 1)
+    except Exception as exc:
+        logging.error("Error listing concluded sessions: %s", exc, exc_info=True)
+        return tool_error(f"Failed to list concluded sessions: {exc}", success=False)
+    has_more = len(rows) > page_limit
+    results = rows[:page_limit]
+    for row in results:
+        row["link"] = _session_link(row["session_id"], link_profile)
+    next_cursor = {"ended_at": cursor_ended_at, "session_id": cursor_session_id}
+    if results:
+        candidate = (float(results[-1]["ended_at"]), str(results[-1]["session_id"]))
+        if candidate <= (cursor_ended_at, cursor_session_id):
+            return tool_error("concluded-session feed returned a regressive cursor", success=False)
+        next_cursor = {"ended_at": candidate[0], "session_id": candidate[1]}
+    return json.dumps({"success": True, "mode": "concluded", "results": results,
+                       "count": len(results), "has_more": has_more,
+                       "next_cursor": next_cursor}, ensure_ascii=False)
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
@@ -859,6 +909,9 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    concluded_only: bool = False,
+    after_ended_at: float = None,
+    after_session_id: str = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -903,6 +956,12 @@ def session_search(
         if profile_db is not None:
             db = profile_db
             current_session_id = None
+
+    if concluded_only:
+        if ((isinstance(query, str) and query.strip()) or session_id is not None or around_message_id is not None):
+            return tool_error("concluded_only cannot be combined with query, session_id, or around_message_id", success=False)
+        return _concluded_feed(db, limit=limit, after_ended_at=after_ended_at,
+                               after_session_id=after_session_id, link_profile=profile)
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -996,7 +1055,7 @@ SESSION_SEARCH_SCHEMA = {
         "and why before falling back to session history. Do not conclude 'not found' "
         "or 'no prior correspondence' from session_search alone when a direct source "
         "was provided.\n\n"
-        "FOUR CALLING SHAPES\n\n"
+        "FIVE CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
@@ -1131,6 +1190,12 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "concluded_only": {"type": "boolean", "default": False,
+                "description": "Return newly concluded conversation tips as metadata only."},
+            "after_ended_at": {"type": "number",
+                "description": "Concluded-feed cursor timestamp; pair with after_session_id."},
+            "after_session_id": {"type": "string",
+                "description": "Concluded-feed cursor tie-breaker; pair with after_ended_at."},
         },
         "required": [],
     },
@@ -1153,6 +1218,9 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         profile=args.get("profile"),
+        concluded_only=args.get("concluded_only", False),
+        after_ended_at=args.get("after_ended_at"),
+        after_session_id=args.get("after_session_id"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),

@@ -1761,6 +1761,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     around_message_id=next_args.get("around_message_id"),
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
+                    profile=next_args.get("profile"),
+                    concluded_only=next_args.get("concluded_only", False),
+                    after_ended_at=next_args.get("after_ended_at"),
+                    after_session_id=next_args.get("after_session_id"),
                     db=session_db,
                     current_session_id=agent.session_id,
                 )

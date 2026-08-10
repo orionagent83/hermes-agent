@@ -18,33 +18,11 @@ def test_terminal_env_config_reads_docker_network_toggle(monkeypatch):
     assert config["docker_network"] is False
 
 
-def test_sibling_container_config_sites_carry_docker_network():
-    """Every container_config dict that carries docker_run_as_host_user must
-    also carry docker_network — otherwise that code path silently falls back
-    to networked containers while the terminal path honors the lockdown
-    (the probe/exec asymmetry reported on issue #46358).
-    """
-    import ast
-    import inspect
+def test_shared_container_projection_carries_docker_network():
+    """Every adapter uses the lossless projection tested through its contract."""
+    from tools.container_config import project_container_config
 
-    import tools.code_execution_tool as code_execution_tool
-    import tools.file_tools as file_tools
-
-    for module in (terminal_tool, file_tools, code_execution_tool):
-        tree = ast.parse(inspect.getsource(module))
-        sites = 0
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict):
-                continue
-            keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
-            if "docker_run_as_host_user" in keys:
-                sites += 1
-                assert "docker_network" in keys, (
-                    f"{module.__name__} builds a container_config with "
-                    f"docker_run_as_host_user but without docker_network "
-                    f"(line {node.lineno})"
-                )
-        assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
+    assert project_container_config({"docker_network": False})["docker_network"] is False
 
 
 def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):

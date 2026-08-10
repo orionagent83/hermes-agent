@@ -905,6 +905,65 @@ def _install_fake_thread(monkeypatch):
     monkeypatch.setattr(threading, "Thread", _FakeThread)
 
 
+class _DeferredCleanupThread(_FakeThread):
+    """Run the cleanup target only when the lifecycle coordinator joins it."""
+
+    def start(self):
+        pass
+
+    def join(self, timeout=None):
+        if not self._done and self._target is not None:
+            self._target()
+        self._done = True
+
+
+def test_cleanup_all_environments_awaits_non_persistent_docker_removal(
+    monkeypatch, tmp_path
+):
+    """One-shot cleanup must await Docker stop/rm before draining the registry.
+
+    The atexit hook cannot recover the worker after ``cleanup_all_environments``
+    empties ``_active_environments``, so the coordinator itself must retain and
+    join the environment objects.
+    """
+    from tools import terminal_tool
+    import threading
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(threading, "Thread", _DeferredCleanupThread)
+    monkeypatch.setattr(terminal_tool, "_get_scratch_dir", lambda: tmp_path)
+
+    env = _make_dummy_env(
+        task_id="cleanup-all-no-persist",
+        persist_across_processes=False,
+    )
+    cleanup_calls = []
+    real_run = docker_env.subprocess.run
+
+    def _capturing_run(cmd, **kwargs):
+        cleanup_calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _capturing_run)
+    terminal_tool._active_environments["cleanup-all-no-persist"] = env
+    terminal_tool._last_activity["cleanup-all-no-persist"] = 0.0
+    try:
+        assert terminal_tool.cleanup_all_environments() == 1
+    finally:
+        terminal_tool._active_environments.pop("cleanup-all-no-persist", None)
+        terminal_tool._last_activity.pop("cleanup-all-no-persist", None)
+
+    docker_subcommands = [
+        call[0][1]
+        for call in cleanup_calls
+        if isinstance(call[0], list) and len(call[0]) >= 2
+    ]
+    assert docker_subcommands == ["stop", "rm"]
+    assert env.wait_for_cleanup(timeout=0) is True
+
+
 def test_cleanup_with_persist_is_noop_for_container(monkeypatch):
     """``persist_across_processes=True`` (default) cleanup must NEITHER stop
     NOR remove the container — the docs promise "ONE long-lived container
