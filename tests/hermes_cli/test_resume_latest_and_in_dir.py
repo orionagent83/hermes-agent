@@ -208,6 +208,25 @@ def test_in_dir_sets_no_restore_cwd(main_mod, launched, monkeypatch, tmp_path):
     assert args.no_restore_cwd is True
 
 
+def test_in_dir_overrides_stale_terminal_cwd(main_mod, launched, monkeypatch, tmp_path):
+    """The explicit workspace must win for terminal/file/code tool resolution."""
+    import os
+
+    target = tmp_path / "explicit-workspace"
+    target.mkdir()
+    stale = tmp_path / "launch-workspace"
+    stale.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(stale))
+    start = os.getcwd()
+
+    try:
+        with pytest.raises(SystemExit):
+            main_mod.cmd_chat(_args(in_dir=str(target)))
+        assert os.environ["TERMINAL_CWD"] == str(target.resolve())
+    finally:
+        os.chdir(start)
+
+
 def test_in_dir_missing_directory_exits(main_mod, monkeypatch, tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         main_mod.cmd_chat(_args(in_dir=str(tmp_path / "nope")))

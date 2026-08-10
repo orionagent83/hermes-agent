@@ -2528,11 +2528,10 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
-def cmd_chat(args):
-    """Run interactive chat CLI."""
-    use_tui = _resolve_use_tui(args)
-
-    _apply_safe_mode(args)
+def _apply_in_dir(args) -> None:
+    """Apply ``--in DIR`` before agent/tool startup and pin every tool there."""
+    if getattr(args, "_in_dir_applied", False):
+        return
 
     # --in DIR: run in DIR. Must happen before any session resolution so the
     # workspace-scoped "latest"/-c lookups key off DIR, and it pins the
@@ -2549,7 +2548,21 @@ def cmd_chat(args):
         except OSError as e:
             print(f"Error: cannot enter --in directory {in_dir}: {e}")
             sys.exit(1)
+        # Keep every tool surface on the same explicit workspace.  A configured
+        # ``terminal.cwd`` is bridged to TERMINAL_CWD before cmd_chat runs; if
+        # it still points at the launch directory, terminal/file/code tools
+        # would ignore the chdir above and operate in the stale workspace.
+        os.environ["TERMINAL_CWD"] = _target_dir
         args.no_restore_cwd = True
+        args._in_dir_applied = True
+
+
+def cmd_chat(args):
+    """Run interactive chat CLI."""
+    use_tui = _resolve_use_tui(args)
+
+    _apply_safe_mode(args)
+    _apply_in_dir(args)
 
     # --resume latest: keyword for "most recent session" — same resolution
     # as `-c` with no name (workspace-scoped MRU, then global fallback).
@@ -10960,6 +10973,7 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     if getattr(args, "oneshot", None):
+        _apply_in_dir(args)
         _prepare_agent_startup(args)
         _run_and_exit_oneshot(
             args.oneshot,
@@ -12621,6 +12635,11 @@ def main():
     # value is already False and --yolo silently does nothing.
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+
+    # One-shot bypasses cmd_chat(), so its explicit workspace must be applied
+    # before plugin/tool discovery freezes cwd-derived runtime state.
+    if getattr(args, "oneshot", None):
+        _apply_in_dir(args)
 
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated

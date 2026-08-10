@@ -15,6 +15,8 @@ fail — catching the exact #60328 regression.
 import os
 import sys
 
+import pytest
+
 
 def _run_main_and_capture_yolo_at_startup(monkeypatch, argv):
     """Run main() with *argv*, capturing HERMES_YOLO_MODE at the
@@ -53,5 +55,90 @@ def test_top_level_yolo_flag_sets_env_before_startup(monkeypatch):
         "called from main() with --yolo. This is the #60328 regression: "
         "the env var is set too late (inside cmd_chat, after tool imports)."
     )
+
+
+def test_top_level_oneshot_in_dir_pins_tools_before_startup(monkeypatch, tmp_path):
+    """One-shot skips cmd_chat, so --in must be applied before tool imports."""
+    import hermes_cli.main as main_mod
+
+    target = tmp_path / "workspace"
+    target.mkdir()
+    stale = tmp_path / "launch"
+    stale.mkdir()
+    captured = {}
+    start = os.getcwd()
+
+    def spy_prepare_startup(args):
+        captured["cwd"] = os.getcwd()
+        captured["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+
+    def stop_oneshot(*args, **kwargs):
+        raise SystemExit(0)
+
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", spy_prepare_startup)
+    monkeypatch.setattr(main_mod, "_run_and_exit_oneshot", stop_oneshot)
+    monkeypatch.setenv("TERMINAL_CWD", str(stale))
+    monkeypatch.setattr(
+        sys, "argv", ["hermes", "--in", str(target), "-z", "probe"]
+    )
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main_mod.main()
+        assert exc.value.code == 0
+    finally:
+        os.chdir(start)
+
+    assert captured == {
+        "cwd": str(target.resolve()),
+        "terminal_cwd": str(target.resolve()),
+    }
+
+
+def test_termux_fast_oneshot_in_dir_pins_tools_before_startup(monkeypatch, tmp_path):
+    """Termux fast one-shot must apply --in before startup and execution."""
+    import hermes_cli.main as main_mod
+
+    target = tmp_path / "workspace"
+    target.mkdir()
+    stale = tmp_path / "launch"
+    stale.mkdir()
+    captured = {}
+    start = os.getcwd()
+
+    def spy_prepare_startup(args):
+        captured["startup"] = {
+            "cwd": os.getcwd(),
+            "terminal_cwd": os.environ.get("TERMINAL_CWD"),
+        }
+
+    def stop_oneshot(*args, **kwargs):
+        captured["oneshot"] = {
+            "cwd": os.getcwd(),
+            "terminal_cwd": os.environ.get("TERMINAL_CWD"),
+        }
+        raise SystemExit(0)
+
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", spy_prepare_startup)
+    monkeypatch.setattr(main_mod, "_run_and_exit_oneshot", stop_oneshot)
+    monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
+    monkeypatch.delenv("HERMES_TERMUX_DISABLE_FAST_CLI", raising=False)
+    monkeypatch.setenv("TERMINAL_CWD", str(stale))
+    monkeypatch.setattr(
+        sys, "argv", ["hermes", "--in", str(target), "-z", "probe"]
+    )
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main_mod.main()
+        assert exc.value.code == 0
+    finally:
+        os.chdir(start)
+
+    expected = {
+        "cwd": str(target.resolve()),
+        "terminal_cwd": str(target.resolve()),
+    }
+    assert captured == {"startup": expected, "oneshot": expected}
 
 
